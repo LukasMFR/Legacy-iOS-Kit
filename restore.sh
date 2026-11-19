@@ -8119,10 +8119,21 @@ keyboarddock_rebuild_iboot3() {
 
     "$dir/xpwntool" "$stock" "$decrypted" -iv "$iboot_iv" -k "$iboot_key" || error "Could not decrypt original iBoot"
     [[ -s $decrypted ]] || error "Decrypted iBoot is empty"
+    # Some bundled iBoot32Patcher builds return nonzero after writing output.
+    # Match patch_iboot(): validate the newly created file, not only the status.
+    # Remove intermediates first so an earlier attempt cannot pass validation.
+    rm -f "$patched" "$repacked" || error "Could not clear stale iBoot3 files"
+    local patcher_status=0
     "$dir/iBoot32Patcher" "$decrypted" "$patched" --rsa \
-        --boot-partition --boot-ramdisk --logo4 --433 -b "pio-error=0" || error "Could not patch new iBoot3"
-    [[ -s $patched ]] || error "Patched iBoot3 is empty"
+        --boot-partition --boot-ramdisk --logo4 --433 -b "pio-error=0" || patcher_status=$?
+    [[ -s "$patched" ]] || error "Could not patch new iBoot3 (patcher exit status: $patcher_status)"
+    if [[ $patcher_status != 0 ]]; then
+        warn "iBoot32Patcher returned $patcher_status; checking generated iBoot3 before proceeding"
+    fi
     strings -a "$patched" | grep -Fqx 'pio-error=0' || error "New iBoot3 does not contain the requested clean bootargs"
+    if cmp -s "$decrypted" "$patched"; then
+        error "Patched iBoot3 is identical to the stock iBoot"
+    fi
 
     # Match the iBEC-formatted image produced by patch_iboot().
     "$dir/xpwntool" "$patched" "$repacked" -t "$stock" || error "Could not repackage iBoot3"
