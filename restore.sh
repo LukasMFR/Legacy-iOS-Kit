@@ -4843,12 +4843,12 @@ ipsw_prepare_ios4multipart() {
     fi
     [[ -n $device_bootargs ]] && bootargs+=" $device_bootargs"
     # Keyboard Dock A1359 workaround (Legacy-iOS-Kit issue #1271):
-    # Only apply the confirmed clean-bootargs configuration to the tested
-    # iPad1,1 / iOS 3.2 (7B367) powdersn0w setup; leave other cases intact.
+    # Apply with or without jailbreak; the bootargs are independent of the
+    # jailbreak payload. Jailbreak + Keyboard Dock remains hardware-untested.
     if [[ $device_type == "iPad1,1" && $device_target_vers == "3.2" &&
           $device_target_build == "7B367" && $device_target_powder == 1 &&
           $device_base_vers == "5.1.1" && $device_base_build == "9B206" &&
-          $ipsw_jailbreak != 1 && $ipsw_verbose != 1 && -z $device_bootargs ]]; then
+          $ipsw_verbose != 1 && -z $device_bootargs ]]; then
         bootargs="pio-error=0"
         log "Keyboard Dock A1359 workaround: clean iBoot bootargs for iPad1,1 iOS 3.2"
     fi
