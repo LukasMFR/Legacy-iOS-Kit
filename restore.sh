@@ -8084,15 +8084,82 @@ device_ramdisk() {
     menu_ramdisk
 }
 
+# Rebuild the saved second-stage iBoot from the original iOS 3.2 (7B367)
+# firmware. Never reuse an old iBoot3 when enabling the exploit: a stale file
+# can reintroduce debug=0x2014e serial=3 even after restore.sh was fixed.
+keyboarddock_rebuild_iboot3() {
+    [[ $device_type == "iPad1,1" && $device_vers == "3.2" &&
+       $device_build == "7B367" ]] || error "Keyboard Dock iBoot3 rebuild: unexpected device or iOS build"
+
+    local saved_iboot="../saved/iPad1,1/iBoot3_${device_ecid}"
+    local stock="kbd_iboot3_stock.img3"
+    local decrypted="kbd_iboot3_stock.dec"
+    local patched="kbd_iboot3_patched.dec"
+    local repacked="kbd_iboot3_new.img3"
+    local iboot_name iboot_iv iboot_key
+    log "Keyboard Dock: rebuilding iBoot3 from stock iOS 3.2 (7B367)"
+
+    # Use the same firmware-key service as the existing patch_iboot function.
+    device_fw_key_check temp 7B367
+    iboot_name="$(printf '%s' "$device_fw_key_temp" | "$jq" -er '.keys[] | select(.image == "iBoot") | .filename')" || error "Missing iOS 3.2 iBoot filename"
+    iboot_iv="$(printf '%s' "$device_fw_key_temp" | "$jq" -er '.keys[] | select(.image == "iBoot") | .iv')" || error "Missing iOS 3.2 iBoot IV"
+    iboot_key="$(printf '%s' "$device_fw_key_temp" | "$jq" -er '.keys[] | select(.image == "iBoot") | .key')" || error "Missing iOS 3.2 iBoot key"
+
+    # Prefer the user's original IPSW; otherwise fetch only iBoot via pzb.
+    if [[ -s ../iPad1,1_3.2_7B367_Restore.ipsw ]]; then
+        log "Keyboard Dock: extracting stock iBoot from local iOS 3.2 IPSW"
+        file_extract_from_archive ../iPad1,1_3.2_7B367_Restore.ipsw "$all_flash/$iboot_name" || error "Failed to extract original iBoot"
+        mv "$iboot_name" "$stock" || error "Cannot stage original iBoot"
+    else
+        ipsw_get_url 7B367
+        [[ -n $ipsw_url ]] || error "No iOS 3.2 firmware URL; place original iPad1,1_3.2_7B367_Restore.ipsw in the kit directory"
+        download_with_pzb "$ipsw_url" "$all_flash/$iboot_name" "$stock" || error "Could not download stock iOS 3.2 iBoot"
+    fi
+    [[ -s $stock ]] || error "Stock iBoot is missing or empty"
+
+    "$dir/xpwntool" "$stock" "$decrypted" -iv "$iboot_iv" -k "$iboot_key" || error "Could not decrypt original iBoot"
+    [[ -s $decrypted ]] || error "Decrypted iBoot is empty"
+    "$dir/iBoot32Patcher" "$decrypted" "$patched" --rsa \
+        --boot-partition --boot-ramdisk --logo4 --433 -b "pio-error=0" || error "Could not patch new iBoot3"
+    [[ -s $patched ]] || error "Patched iBoot3 is empty"
+    strings -a "$patched" | grep -Fqx 'pio-error=0' || error "New iBoot3 does not contain the requested clean bootargs"
+
+    # Match the iBEC-formatted image produced by patch_iboot().
+    "$dir/xpwntool" "$patched" "$repacked" -t "$stock" || error "Could not repackage iBoot3"
+    printf '0000010: 6365\n0000020: 6365\n' | xxd -r - "$repacked" || error "Could not set iBEC image tag"
+    [[ -s $repacked ]] || error "Repacked iBoot3 is empty"
+    mkdir -p ../saved/iPad1,1 || error "Could not create saved iBoot directory"
+
+    # Preserve the previous file rather than silently losing its contents.
+    if [[ -e $saved_iboot ]]; then
+        local backup
+        backup="$(mktemp "${saved_iboot}.backup.XXXXXXXX")" || error "Cannot reserve iBoot3 backup filename"
+        cp -p "$saved_iboot" "$backup" || error "Could not back up old iBoot3"
+        log "Keyboard Dock: previous iBoot3 backed up to $backup"
+    fi
+    mv "$repacked" "$saved_iboot" || error "Could not install rebuilt iBoot3 in the local cache"
+    log "Keyboard Dock: fresh iBoot3 ready at $saved_iboot (pio-error=0)"
+}
+
 device_ramdisk_setnvram() {
     local boot_ramdisk="nvram boot-ramdisk=/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z/0/1/2/3/4/5/6/7/8/9/A/B/C/disk.dmg"
+    # Preflight on the SSH ramdisk: build a fresh iBoot3 BEFORE writing NVRAM
+    # or modifying the iPad's partition table.
+    if [[ $rec == 2 && $device_type == "iPad1,1" ]]; then
+        device_ramdisk_iosvers
+        [[ -n $device_vers && -n $device_build ]] || error "Cannot identify iPad iOS version before Enable Exploit"
+        if [[ $device_vers == "3.2" && $device_build == "7B367" ]]; then
+            keyboarddock_rebuild_iboot3
+        fi
+    fi
     log "Sending commands for setting NVRAM variables..."
     $ssh -p $ssh_port root@127.0.0.1 "nvram -c; nvram boot-partition=$rec"
     if [[ $rec == 2 ]]; then
         case $device_type in
             iPad1,1 | iPhone3,1 | iPod3,1 )
                 if [[ $device_type != "iPhone3,1" ]]; then
-                    device_ramdisk_iosvers
+                    # Already read while doing iPad1,1 preflight above.
+                    [[ $device_type == "iPad1,1" ]] || device_ramdisk_iosvers
                     if [[ $device_vers_maj == 3 ]]; then
                         device_ramdisk_ios3exploit
                     fi
@@ -8138,7 +8205,8 @@ device_ramdisk_ios3exploit() {
     $scp -P $ssh_port ../resources/firmware/src/target/$device_model/9B206/exploit root@127.0.0.1:/
     $ssh -p $ssh_port root@127.0.0.1 "dd of=/dev/rdisk0s3 if=/exploit bs=64k count=1"
     if [[ $device_type == "iPad1,1" ]]; then
-        $scp -P $ssh_port ../saved/iPad1,1/iBoot3_$device_ecid root@127.0.0.1:/mnt1/iBEC
+        [[ -s ../saved/iPad1,1/iBoot3_$device_ecid ]] || error "Missing saved iBoot3. Cannot enable the exploit safely"
+        $scp -P $ssh_port ../saved/iPad1,1/iBoot3_$device_ecid root@127.0.0.1:/mnt1/iBEC || error "Failed to install iBoot3 on iPad"
     fi
     if [[ -n $($ssh -p $ssh_port root@127.0.0.1 "ls /mnt1/bin/bash 2>/dev/null") ]]; then
         log "fstab"
